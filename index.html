@@ -516,20 +516,90 @@ communication_time ≈ bytes / effective_bandwidth + latency * collective_count
 <li><a href='#doc-03-concepts-access-shrink-md'>准入淘汰</a> + <a href='#doc-03-concepts-ckpt-save-load-md'>checkpoint</a>：控制表容量、落盘恢复。</li>
 </ul>
 <div id='doc-02-domain-map-layer3-data-storage-md-阅读顺序' class='subhead subhead-l3'><h3>阅读顺序</h3><span class='heading-actions'><a href='#toc'>回目录</a></span></div>
-<p>顺着一条样本走：特征编码 → 组批 → 查表（五级流水/合表/SparseGroup）→ 准入淘汰/checkpoint。</p></div></section><section id='doc-03-concepts-dynamic-token-batching-md' class='doc-section' data-search='动态 token 预算组批：让 batch 按计算量而不是样本数装 03_concepts/dynamic_token_batching.md ## 一句话结论  动态 token 预算组批解决的是**长短样本混在一起时，每个 rank 的真实计算量不均**。它把组批单位从固定样本数改成固定 token 预算：长历史样本少装，短历史样本多装，让每个 micro-batch 的 token 量接近，从而减少多卡同步时“快 rank 等慢 rank”。同一条输入链路上还用了 Arrow 列式备数，但 Arrow 解决的是 CPU 逐行对象处理开销，不能和 token 预算的收益混为一谈。  ## 问题与设计主线：先按 token 量切 batch，再用 Arrow 高效备数  固定 `batch_size=N` 的隐含假设是“每条样本成本差不多”，但推荐样本的历史长度差异很大。同样 128 条样本，可能一批大多是长历史，另一批大多是短历史；前者 attention、embedding、backbone 都更重，后者先算完也不能进入下一步，因为梯度同步、EP dispatch/combine 这类同步点要等最慢 rank 到齐。所以核心矛盾不是 batch size 大小本身，而是**样本条数不能代表真实计算量**。  设计上拆成两件事，但它们在同一条数据路径上顺序发生：第一，`token_counter_fn` 给每行样本估一个 token 成本，Reader 用 `max_tokens` 决定哪些行组成一个 batch；第二，选出来的这些行用 Arrow 列式读取和零拷贝 collator 变成训练张量。前者决定“这一批装谁”，目标是压平负载；后者决定“这一批怎么高效变成张量”，目标是降低 CPU collate/解析开销。收益归因时必须分开问：是跨卡等待减少，还是 CPU 备数变快。  具体组批不是拍脑袋随机装，而是一个稳定的切分流程：Reader 一次读 R 行形成 chunk；对每行算 token 成本；做前缀和，找到累计成本 `≤ M(max_tokens)` 的最长前缀作为一个 batch；chunk 里没用完的行作为 carry 留到下一个 batch 或下一个 chunk 继续凑。项目配置里 `max_tokens=286720`，Reader chunk 1024；`file_reader_batch_size` 表示一次读多少行，不是最终训练 batch 大小；动态路径下 `batch_size=None`，因为 batch 已经由数据集按 token 预算切好了。  ## 执行边界与正确性：Reader 只管切批，OneRec 组装业务张量，loss 按全局 N 归一  工程边界在 `collate_fn`。`airecord` 是通用 IO 层，负责读文件、按预算组批、断点续训和 EOS 退出；它只需要知道每行成本和 batch 切点，不认识 OneRec 的 `seq_grou'><div class='section-head'><h2>动态 token 预算组批：让 batch 按计算量而不是样本数装</h2><div class='doc-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></div></div><div class='path'>03_concepts/dynamic_token_batching.md</div><div class='doc-body'><div id='doc-03-concepts-dynamic-token-batching-md-一句话结论' class='subhead subhead-l3'><h3>一句话结论</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></span></div>
-<p>动态 token 预算组批解决的是<strong>长短样本混在一起时，每个 rank 的真实计算量不均</strong>。它把组批单位从固定样本数改成固定 token 预算：长历史样本少装，短历史样本多装，让每个 micro-batch 的 token 量接近，从而减少多卡同步时“快 rank 等慢 rank”。同一条输入链路上还用了 Arrow 列式备数，但 Arrow 解决的是 CPU 逐行对象处理开销，不能和 token 预算的收益混为一谈。</p>
+<p>顺着一条样本走：特征编码 → 组批 → 查表（五级流水/合表/SparseGroup）→ 准入淘汰/checkpoint。</p></div></section><section id='doc-03-concepts-dynamic-token-batching-md' class='doc-section' data-search='动态 token 预算组批：让 batch 按计算量而不是样本数装 03_concepts/dynamic_token_batching.md ## 一句话结论  动态 token 预算组批解决的是：**长短样本混在一起时，每个 rank 的真实计算量不均**。  它把组批单位从固定样本数改成固定 token 预算：**长历史样本少装，短历史样本多装**，让每个 micro-batch 的 token 量接近，从而减少多卡同步时“快 rank 等慢 rank”。同一条输入链路上还用了 **Arrow 列式备数**，但 Arrow 解决的是 CPU 逐行对象处理开销，不能和 token 预算的收益混为一谈。  ## 问题与设计主线：先按 token 量切 batch，再用 Arrow 高效备数  固定 `batch_size=N` 的隐含假设是：**每条样本成本差不多**。推荐样本不满足这个假设，因为历史长度差异很大：  - **长历史 batch**：attention、embedding、backbone 都更重，step 时间长。 - **短历史 batch**：先算完也不能进入下一步，因为梯度同步、EP dispatch/combine 等同步点要等最慢 rank。  所以核心矛盾不是 batch size 大小，而是：**样本条数不能代表真实计算量**。  设计拆成两件事，顺序发生在同一条数据路径上：  | 环节 | 决定什么 | 解决什么 | |---|---|---| | **token 预算组批** | 哪些行组成一个 batch | 每个 batch 计算量不均，导致跨卡等待 | | **Arrow / collator 备数** | 这些行怎么变成训练张量 | Python 逐行对象构造慢，CPU 备数开销高 |  收益归因时必须分开：**负载更均匀** 和 **CPU 备数更快** 是两条不同链路。  具体切 batch 的流程是：  1. **读 chunk**：Reader 一次读 R 行。 2. **算成本**：`token_counter_fn` 给每行样本估 token 成本。 3. **做前缀和**：计算前 k 行累计 token 成本。 4. **找切点**：选累计成本 `≤ M(max_tokens)` 的最长前缀。 5. **保留 carry**：没用完的行带到下一个 batch 或下一个 chunk。  项目配置示例：`max_tokens=286720`，Reader chunk 1024。这里要分清：**`file_reader_batch_size` 是一次读多少行，不是最终训练 batch 大小**；动态路径下 `batch_size=None`，因为 batch 已由数据集按 token 预算切好了。  ## 执行边界与正确性：Reader 只管切批，OneRec 组装业务张量，loss 按全局 N 归一  工程边界在 `collate_fn`：  '><div class='section-head'><h2>动态 token 预算组批：让 batch 按计算量而不是样本数装</h2><div class='doc-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></div></div><div class='path'>03_concepts/dynamic_token_batching.md</div><div class='doc-body'><div id='doc-03-concepts-dynamic-token-batching-md-一句话结论' class='subhead subhead-l3'><h3>一句话结论</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></span></div>
+<p>动态 token 预算组批解决的是：<strong>长短样本混在一起时，每个 rank 的真实计算量不均</strong>。</p>
+<p>它把组批单位从固定样本数改成固定 token 预算：<strong>长历史样本少装，短历史样本多装</strong>，让每个 micro-batch 的 token 量接近，从而减少多卡同步时“快 rank 等慢 rank”。同一条输入链路上还用了 <strong>Arrow 列式备数</strong>，但 Arrow 解决的是 CPU 逐行对象处理开销，不能和 token 预算的收益混为一谈。</p>
 <div id='doc-03-concepts-dynamic-token-batching-md-问题与设计主线-先按-token-量切-batch-再用-arrow-高效备数' class='subhead subhead-l3'><h3>问题与设计主线：先按 token 量切 batch，再用 Arrow 高效备数</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></span></div>
-<p>固定 <code>batch_size=N</code> 的隐含假设是“每条样本成本差不多”，但推荐样本的历史长度差异很大。同样 128 条样本，可能一批大多是长历史，另一批大多是短历史；前者 attention、embedding、backbone 都更重，后者先算完也不能进入下一步，因为梯度同步、EP dispatch/combine 这类同步点要等最慢 rank 到齐。所以核心矛盾不是 batch size 大小本身，而是<strong>样本条数不能代表真实计算量</strong>。</p>
-<p>设计上拆成两件事，但它们在同一条数据路径上顺序发生：第一，<code>token_counter_fn</code> 给每行样本估一个 token 成本，Reader 用 <code>max_tokens</code> 决定哪些行组成一个 batch；第二，选出来的这些行用 Arrow 列式读取和零拷贝 collator 变成训练张量。前者决定“这一批装谁”，目标是压平负载；后者决定“这一批怎么高效变成张量”，目标是降低 CPU collate/解析开销。收益归因时必须分开问：是跨卡等待减少，还是 CPU 备数变快。</p>
-<p>具体组批不是拍脑袋随机装，而是一个稳定的切分流程：Reader 一次读 R 行形成 chunk；对每行算 token 成本；做前缀和，找到累计成本 <code>≤ M(max_tokens)</code> 的最长前缀作为一个 batch；chunk 里没用完的行作为 carry 留到下一个 batch 或下一个 chunk 继续凑。项目配置里 <code>max_tokens=286720</code>，Reader chunk 1024；<code>file_reader_batch_size</code> 表示一次读多少行，不是最终训练 batch 大小；动态路径下 <code>batch_size=None</code>，因为 batch 已经由数据集按 token 预算切好了。</p>
+<p>固定 <code>batch_size=N</code> 的隐含假设是：<strong>每条样本成本差不多</strong>。推荐样本不满足这个假设，因为历史长度差异很大：</p>
+<ul>
+<li><strong>长历史 batch</strong>：attention、embedding、backbone 都更重，step 时间长。</li>
+<li><strong>短历史 batch</strong>：先算完也不能进入下一步，因为梯度同步、EP dispatch/combine 等同步点要等最慢 rank。</li>
+</ul>
+<p>所以核心矛盾不是 batch size 大小，而是：<strong>样本条数不能代表真实计算量</strong>。</p>
+<p>设计拆成两件事，顺序发生在同一条数据路径上：</p>
+<div class='table-wrap'><table>
+<tr><th>环节</th><th>决定什么</th><th>解决什么</th></tr>
+<tr><td><strong>token 预算组批</strong></td><td>哪些行组成一个 batch</td><td>每个 batch 计算量不均，导致跨卡等待</td></tr>
+<tr><td><strong>Arrow / collator 备数</strong></td><td>这些行怎么变成训练张量</td><td>Python 逐行对象构造慢，CPU 备数开销高</td></tr>
+</table></div>
+<p>收益归因时必须分开：<strong>负载更均匀</strong> 和 <strong>CPU 备数更快</strong> 是两条不同链路。</p>
+<p>具体切 batch 的流程是：</p>
+<ol>
+<li><strong>读 chunk</strong>：Reader 一次读 R 行。</li>
+<li><strong>算成本</strong>：<code>token_counter_fn</code> 给每行样本估 token 成本。</li>
+<li><strong>做前缀和</strong>：计算前 k 行累计 token 成本。</li>
+<li><strong>找切点</strong>：选累计成本 <code>≤ M(max_tokens)</code> 的最长前缀。</li>
+<li><strong>保留 carry</strong>：没用完的行带到下一个 batch 或下一个 chunk。</li>
+</ol>
+<p>项目配置示例：<code>max_tokens=286720</code>，Reader chunk 1024。这里要分清：<strong><code>file_reader_batch_size</code> 是一次读多少行，不是最终训练 batch 大小</strong>；动态路径下 <code>batch_size=None</code>，因为 batch 已由数据集按 token 预算切好了。</p>
 <div id='doc-03-concepts-dynamic-token-batching-md-执行边界与正确性-reader-只管切批-onerec-组装业务张量-loss-按全局-n-归一' class='subhead subhead-l3'><h3>执行边界与正确性：Reader 只管切批，OneRec 组装业务张量，loss 按全局 N 归一</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></span></div>
-<p>工程边界在 <code>collate_fn</code>。<code>airecord</code> 是通用 IO 层，负责读文件、按预算组批、断点续训和 EOS 退出；它只需要知道每行成本和 batch 切点，不认识 OneRec 的 <code>seq_groups</code> 等业务字段。OneRec 是领域层，<code>ColumnarArrowCollator</code> / <code>KJTCollator</code> 接收 airecord 给出的列式 batch，再把业务字段组装成 <code>KeyedJaggedTensor</code> 和 <code>[B,W]</code> 标签。依赖方向是单向的：OneRec import airecord，airecord 不认识 OneRec。这样切分的意义是让通用 Reader 可复用，业务语义只留在领域 collator 里。</p>
-<p>动态 batch 还会带来一个训练正确性问题：每个 micro-batch 的有效监督 token 数 <code>n_micro</code> 不同。如果仍然在每个 micro 内先做 mean，再对 micro 求平均，那么 3 个有效 token 的 micro 和 9 个有效 token 的 micro 会被等权处理，训练目标被改掉。正确目标应该等价于一次更新窗口内 <code>loss_update = 全局 Σloss / 全局有效监督 token 总数 N</code>。实现上，模型 forward 返回 sum（<code>reduction=&quot;sum&quot;</code>），训练循环累计整个更新窗口的有效监督 token 总数 <code>N</code>，关掉 DeepSpeed 默认 <code>/GAS</code>（<code>scale_wrt_gas=False</code>），再在窗口边界用 <code>scale_gradients</code> 把 <code>W/N</code> 补回来（<code>W</code> 是数据并行卡数）。一句话：<strong>batch 可以动态，但每个有效监督 token 在 loss 里的权重不能变</strong>。</p>
+<p>工程边界在 <code>collate_fn</code>：</p>
+<ul>
+<li><strong>airecord（通用 IO 层）</strong>：读文件、按预算组批、断点续训、EOS 退出；只知道每行成本和 batch 切点。</li>
+<li><strong>OneRec（领域层）</strong>：读取 <code>seq_groups</code> 等业务字段，把列式 batch 组装成 <code>KeyedJaggedTensor</code> 和 <code>[B,W]</code> 标签。</li>
+</ul>
+<p>依赖方向是：<strong>OneRec import airecord，airecord 不认识 OneRec</strong>。这样通用 Reader 可复用，业务语义留在领域 collator 里。</p>
+<p>动态 batch 还会带来正确性问题：每个 micro-batch 的 <strong>有效监督 token 数 <code>n_micro</code> 不同</strong>。如果每个 micro 内先求 mean，再对 micro 求平均，那么 3 个有效 token 的 micro 和 9 个有效 token 的 micro 会被等权处理，训练目标就变了。</p>
+<p>正确目标应该等价于：</p>
+<pre><code>
+loss_update = 全局 Σloss / 全局有效监督 token 总数 N
+
+</code></pre>
+<p>实现口径是：</p>
+<ol>
+<li>模型 forward 返回 <strong>sum</strong>（<code>reduction=&quot;sum&quot;</code>），不要在 micro 内除以 <code>n_micro</code>。</li>
+<li>训练循环累计整个更新窗口的有效监督 token 总数 <strong>N</strong>。</li>
+<li>关掉 DeepSpeed 默认 <code>/GAS</code>（<code>scale_wrt_gas=False</code>），避免重复缩放。</li>
+<li>窗口边界用 <code>scale_gradients</code> 补回 <strong><code>W/N</code></strong>（<code>W</code> 是数据并行卡数）。</li>
+</ol>
+<p>一句话：<strong>batch 可以动态，但每个有效监督 token 在 loss 里的权重不能变</strong>。</p>
 <div id='doc-03-concepts-dynamic-token-batching-md-为什么有效-什么时候不有效' class='subhead subhead-l3'><h3>为什么有效、什么时候不有效</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></span></div>
-<p>这张卡的收益有两条因果链。token 预算组批的链路是：历史长度差异大 → 固定样本数组批导致各 rank token 量不均 → 慢 rank 决定同步点完成时间 → 按 token 预算组批压平每个 micro 的真实计算量 → 快 rank 等慢 rank 的时间减少。Arrow 列式备数的链路是：逐行 Python 对象构造多 → CPU collate/解析时间高 → GPU 等数据 → Arrow 列式读取 + 零拷贝 collator → CPU 备数开销下降。两条链路可以叠加，但不能互相替代。</p>
-<p>它有效的前提是：样本历史长度分布确实很不均，且多卡同步等待或 CPU 备数是主要瓶颈。它收益不大的情况也要说清：如果样本长度本来均匀，或者瓶颈在显存、通信带宽、MoE all-to-all，而不是 batch 内 token 波动，那么动态组批不会自动带来大收益。评估默认看累计 <code>per_rank_samples/s</code>、MFU 和 step time 分布，不能只看单个 batch。</p>
+<p>动态 token 预算组批的因果链是：</p>
+<pre><code>
+历史长度差异大
+
+→ 固定样本数组批导致各 rank token 量不均
+
+→ 慢 rank 决定同步点完成时间
+
+→ 按 token 预算组批压平 micro 的真实计算量
+
+→ 快 rank 等慢 rank 的时间减少
+
+</code></pre>
+<p>Arrow 列式备数的因果链是：</p>
+<pre><code>
+逐行 Python 对象构造多
+
+→ CPU collate/解析时间高
+
+→ GPU 等数据
+
+→ Arrow 列式读取 + 零拷贝 collator
+
+→ CPU 备数开销下降
+
+</code></pre>
+<p>有效前提：<strong>样本历史长度分布很不均</strong>，并且 <strong>多卡同步等待或 CPU 备数是瓶颈</strong>。</p>
+<p>收益不大的情况：样本长度本来均匀，或瓶颈在显存、通信带宽、MoE all-to-all，而不是 batch 内 token 波动。评估默认看累计 <code>per_rank_samples/s</code>、MFU 和 step time 分布，不能只看单个 batch。</p>
 <div id='doc-03-concepts-dynamic-token-batching-md-和我的项目怎么关联-项目口径-来源与待核验' class='subhead subhead-l3'><h3>和我的项目怎么关联：项目口径、来源与待核验</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></span></div>
-<p>项目一用它压平跨卡负载：按 <code>max_tokens</code> 动态切 batch，配合 Arrow 列式备数和 OneRec 领域 collator，解决历史长度差异导致的每卡 token 量不均，以及梯度同步、EP dispatch/combine 等同步点上的 straggler。J13（Qwen3-4B、G5×2）实测：固定 batch per-rank 133.60 samples/s、MFU 34.77%；动态预算 batch 为 169.35～182.10 samples/s（+26.76%～36.30%）、MFU 42.86%～45.92%（+8.09～11.15 个百分点）。注意 J14 是另一组对比（Base 已用动态 MTB，再比 AIRecord 动态路径），MFU 只差约 0.09 个百分点，统计上不显著，不能和 J13 的“固定 vs 动态”混为一谈。</p></div></section><section id='doc-03-concepts-feature-hash-md' class='doc-section' data-search='特征编码：ID 怎么变成全局唯一 key 03_concepts/feature_hash.md ## 一句话结论  同名不同字段必须查 embedding 表里**不同的两行**：`brand=&quot;Nike&quot;` 和 `shop=&quot;Nike&quot;` 字面相同，但一个是品牌行、一个是店铺行，只拿 `&quot;Nike&quot;` 算 key 就会**撞车**。所以 key 不能只由 ID 决定，要带上**字段身份**——先判类型（是否查表）、string 先分词，最后把 `(slot, id)` 编码成一个**全局唯一 key**。  ## 怎么设计：ID → key 三步  1. **判类型**：`FeatureInfo.type` 是 CATEGORICAL 才走稀疏查表，NUMERICAL 直接进 dense。 2. **string 分词**：`TokenizeSparse` 把 query 等 string 切成变长 token（jagged：indices+values+shape）；有词表出 token id，没词表出字符串交给下一步 hash。 3. **global_hash**：`key = Hash64Combine(Hash64(slot_name), Hash64(id))`，用 **slot 前缀做命名空间隔离**。  ## 为什么有效：slot 前缀隔离，同名不同字段不撞  `brand` 和 `shop` 的 `Hash64(&quot;Nike&quot;)` 相同，但 **`Hash64(&quot;brand&quot;) ≠ Hash64(&quot;shop&quot;)`**，`Combine` 后 key 不同，查不同行。三个要点：  - **“global hash” = 全局只有一张 key 空间**：slot 不是物理分表，而是编码进 key 的逻辑命名空间。 - **`Hash64Combine` 用黄金比例常数 + 双向位移做雪崩扩散**：避免 `a^b` 的交换律碰撞。 - 同时避免“同 slot 海量 id 淹没 slot 区分”的问题。  ## 和我的项目怎么关联  项目里稀疏查表的最前端就是这条链：  - **用了什么能力**：判类型 → string 分词 → `global_hash`，用 slot 前缀把 `(slot, id)` 编码成全局唯一 key。 - **解决什么问题**：长序列多字段同名不同义（`brand=&quot;Nike&quot;` vs `shop=&quot;Nike&quot;`），key 撞了就查错行。 - **达到什么效果**：保证多字段、多表查表正确，是后续 InputDist 分桶、查表、更新正确性的前提。具体走 NoneHash 还是 Murmur 分支待核验。'><div class='section-head'><h2>特征编码：ID 怎么变成全局唯一 key</h2><div class='doc-actions'><a href='#toc'>回目录</a></div></div><div class='path'>03_concepts/feature_hash.md</div><div class='doc-body'><div id='doc-03-concepts-feature-hash-md-一句话结论' class='subhead subhead-l3'><h3>一句话结论</h3><span class='heading-actions'><a href='#toc'>回目录</a></span></div>
+<p>项目一用它压平跨卡负载：<strong>按 <code>max_tokens</code> 动态切 batch</strong>，配合 Arrow 列式备数和 OneRec 领域 collator，解决历史长度差异导致的每卡 token 量不均，以及梯度同步、EP dispatch/combine 等同步点上的 straggler。</p>
+<p>J13（Qwen3-4B、G5×2）实测：</p>
+<ul>
+<li><strong>固定 batch</strong>：per-rank 133.60 samples/s，MFU 34.77%。</li>
+<li><strong>动态预算 batch</strong>：169.35～182.10 samples/s（+26.76%～36.30%），MFU 42.86%～45.92%（+8.09～11.15 个百分点）。</li>
+</ul>
+<p>注意：J14 是另一组对比（Base 已用动态 MTB，再比 AIRecord 动态路径），MFU 只差约 0.09 个百分点，统计上不显著，不能和 J13 的“固定 vs 动态”混为一谈。</p></div></section><section id='doc-03-concepts-feature-hash-md' class='doc-section' data-search='特征编码：ID 怎么变成全局唯一 key 03_concepts/feature_hash.md ## 一句话结论  同名不同字段必须查 embedding 表里**不同的两行**：`brand=&quot;Nike&quot;` 和 `shop=&quot;Nike&quot;` 字面相同，但一个是品牌行、一个是店铺行，只拿 `&quot;Nike&quot;` 算 key 就会**撞车**。所以 key 不能只由 ID 决定，要带上**字段身份**——先判类型（是否查表）、string 先分词，最后把 `(slot, id)` 编码成一个**全局唯一 key**。  ## 怎么设计：ID → key 三步  1. **判类型**：`FeatureInfo.type` 是 CATEGORICAL 才走稀疏查表，NUMERICAL 直接进 dense。 2. **string 分词**：`TokenizeSparse` 把 query 等 string 切成变长 token（jagged：indices+values+shape）；有词表出 token id，没词表出字符串交给下一步 hash。 3. **global_hash**：`key = Hash64Combine(Hash64(slot_name), Hash64(id))`，用 **slot 前缀做命名空间隔离**。  ## 为什么有效：slot 前缀隔离，同名不同字段不撞  `brand` 和 `shop` 的 `Hash64(&quot;Nike&quot;)` 相同，但 **`Hash64(&quot;brand&quot;) ≠ Hash64(&quot;shop&quot;)`**，`Combine` 后 key 不同，查不同行。三个要点：  - **“global hash” = 全局只有一张 key 空间**：slot 不是物理分表，而是编码进 key 的逻辑命名空间。 - **`Hash64Combine` 用黄金比例常数 + 双向位移做雪崩扩散**：避免 `a^b` 的交换律碰撞。 - 同时避免“同 slot 海量 id 淹没 slot 区分”的问题。  ## 和我的项目怎么关联  项目里稀疏查表的最前端就是这条链：  - **用了什么能力**：判类型 → string 分词 → `global_hash`，用 slot 前缀把 `(slot, id)` 编码成全局唯一 key。 - **解决什么问题**：长序列多字段同名不同义（`brand=&quot;Nike&quot;` vs `shop=&quot;Nike&quot;`），key 撞了就查错行。 - **达到什么效果**：保证多字段、多表查表正确，是后续 InputDist 分桶、查表、更新正确性的前提。具体走 NoneHash 还是 Murmur 分支待核验。'><div class='section-head'><h2>特征编码：ID 怎么变成全局唯一 key</h2><div class='doc-actions'><a href='#toc'>回目录</a></div></div><div class='path'>03_concepts/feature_hash.md</div><div class='doc-body'><div id='doc-03-concepts-feature-hash-md-一句话结论' class='subhead subhead-l3'><h3>一句话结论</h3><span class='heading-actions'><a href='#toc'>回目录</a></span></div>
 <p>同名不同字段必须查 embedding 表里<strong>不同的两行</strong>：<code>brand=&quot;Nike&quot;</code> 和 <code>shop=&quot;Nike&quot;</code> 字面相同，但一个是品牌行、一个是店铺行，只拿 <code>&quot;Nike&quot;</code> 算 key 就会<strong>撞车</strong>。所以 key 不能只由 ID 决定，要带上<strong>字段身份</strong>——先判类型（是否查表）、string 先分词，最后把 <code>(slot, id)</code> 编码成一个<strong>全局唯一 key</strong>。</p>
 <div id='doc-03-concepts-feature-hash-md-怎么设计-id-key-三步' class='subhead subhead-l3'><h3>怎么设计：ID → key 三步</h3><span class='heading-actions'><a href='#toc'>回目录</a></span></div>
 <ol>
@@ -1436,22 +1506,84 @@ Step 7: 对 top-k 输出按 router 权重合并，进入下一层
 <li><strong>用了什么能力</strong>：kernel 提交/执行模型——减少 launch、提高 occupancy、延迟隐藏、stream/event 跨流交接。</li>
 <li><strong>解决什么问题</strong>：单卡内小算子多、GPU 等 CPU/等数据的执行瓶颈。</li>
 <li><strong>达到什么效果</strong>：把“开了编译更快”解释成“融合少 launch、分组 GEMM 提高矩阵单元利用率、双流（Nest）跨流交接”，回答追问时用。</li>
-</ul></div></section><section id='doc-03-concepts-compile-attention-moe-optimization-md' class='doc-section' data-search='编译、FlashAttention 与 MoE 融合：提高单层有效计算密度 03_concepts/compile_attention_moe_optimization.md ## 一句话结论  这张卡不是在讲一种并行策略，而是在讲**模型已经能跑之后，单卡/单层内部还有哪些无效工作可以压掉**。主线只有一条：attention 侧减少 HBM 往返和不可见 block 计算，MoE 侧减少小 GEMM 和 kernel launch，数据组装侧避免多目标互相泄漏；这些优化共同提高有效计算密度，但不直接改变 ZeRO/FSDP/EP 的通信语义。  ## 核心矛盾：同一层里有四类浪费，不能混成一个“加速”  训练慢不一定是模型太大，也可能是同一层内部做了很多低效工作。标准 attention 会生成 `[L,L]` 的 score/probability，中间张量大、HBM 往返多；复杂 mask 如果只是逐点判断，仍可能先算 QKᵀ 再把不可见位置丢掉；Label Packing 虽然能把多个目标拼进一条序列、少算重复历史，但如果组间可见性没处理好，就会发生目标泄漏；MoE native 逐专家 for 循环会产生很多小 GEMM 和 launch，矩阵单元利用率低。  所以这张卡里的四件事必须按对象分清：**FlashAttention 管 attention 中间矩阵的访存，CompileMask 管哪些 attention block 根本不用算，Label Packing 管多目标拼接后的组间隔离，MoE 融合管 expert 内部小 GEMM 的执行组织**。它们都提升单层执行效率，但作用点不同，不能都说成“减少通信量”或“提高算术强度”。  ## Attention 链路：FA 决定块内怎么算，CompileMask 决定哪些块要算，Label Packing 决定哪些 token 允许互看  FlashAttention 解决的是标准 attention 的 IO 问题。它按 tile 读取 Q/K/V，在片上维护行级 max/sum，用 online softmax 得到和标准 attention 等价的结果，但不把完整 `[L,L]` score/probability 写回 HBM；反向时用轻量统计量重算必要块。这里的关键口径是：**FA 不改变标准 attention 的数学目标，主要减少巨大中间矩阵的 HBM 读写**。FA1 主要解决 IO；FA2 改进并行划分；FA3 面向 Hopper 做 TMA 搬运和 WGMMA 异步流水；FA4 面向 Blackwell 继续处理非 MMA 瓶颈，例如指数、shared memory、TMEM 和前后向流水。  CompileMask 解决的是复杂 mask 的表达和块跳过问题。它不是一个固定 mask，而是 UniAttention 自研的声明式 mask 编译栈：frontend 用 BoolExpr/MaskSpec AST 表达 `(q,kv)→boo'><div class='section-head'><h2>编译、FlashAttention 与 MoE 融合：提高单层有效计算密度</h2><div class='doc-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></div></div><div class='path'>03_concepts/compile_attention_moe_optimization.md</div><div class='doc-body'><div id='doc-03-concepts-compile-attention-moe-optimization-md-一句话结论' class='subhead subhead-l3'><h3>一句话结论</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></span></div>
-<p>这张卡不是在讲一种并行策略，而是在讲<strong>模型已经能跑之后，单卡/单层内部还有哪些无效工作可以压掉</strong>。主线只有一条：attention 侧减少 HBM 往返和不可见 block 计算，MoE 侧减少小 GEMM 和 kernel launch，数据组装侧避免多目标互相泄漏；这些优化共同提高有效计算密度，但不直接改变 ZeRO/FSDP/EP 的通信语义。</p>
+</ul></div></section><section id='doc-03-concepts-compile-attention-moe-optimization-md' class='doc-section' data-search='编译、FlashAttention 与 MoE 融合：提高单层有效计算密度 03_concepts/compile_attention_moe_optimization.md ## 一句话结论  这张卡讲的不是并行策略，而是：**模型已经能跑之后，单卡/单层内部还有哪些无效工作可以压掉**。  主线分两段：  - **Attention 侧**：减少 HBM 往返，跳过不可见 block，保证多目标拼接不泄漏。 - **MoE 侧**：减少小 GEMM 和 kernel launch，提高本地 expert 计算效率。  这些优化共同提高有效计算密度，但 **不直接改变 ZeRO/FSDP/EP 的通信语义**。  ## 核心矛盾：同一层里有四类浪费，不能混成一个“加速”  训练慢不一定是模型太大，也可能是同一层内部做了很多低效工作：  | 浪费来源 | 具体问题 | 对应优化 | |---|---|---| | **attention 中间矩阵** | `[L,L]` score/probability 反复落 HBM | FlashAttention | | **复杂 mask** | 不可见位置仍可能先算 QKᵀ 再丢弃 | CompileMask | | **多目标拼接** | Label Packing 省历史编码，但组间可能互看导致泄漏 | Label Packing + CompileMask | | **MoE 小专家计算** | native 逐专家 for 循环，小 GEMM 多、launch 多 | fused grouped GEMM |  所以读这张卡时要先按对象分清：**FA 管访存，CompileMask 管 block 是否要算，Label Packing 管组间可见性，MoE 融合管 expert 本地执行组织**。它们都提升单层执行效率，但不能都说成“减少通信量”或“提高算术强度”。  ## Attention 链路：FA 决定块内怎么算，CompileMask 决定哪些块要算，Label Packing 决定哪些 token 允许互看  FlashAttention 解决的是 **标准 attention 的 IO 问题**：  1. 按 tile 读取 Q/K/V。 2. 在片上维护行级 max/sum。 3. 用 online softmax 得到和标准 attention 等价的结果。 4. 不把完整 `[L,L]` score/probability 写回 HBM。 5. 反向时用轻量统计量重算必要块。  关键口径：**FA 不改变标准 attention 的数学目标，主要减少巨大中间矩阵的 HBM 读写**。FA1 主要解决 IO；FA2 改进并行划分；FA3 面向 Hopper 做 TMA 搬运和 WGMMA 异步流水；FA4 面向 Blackwell 继续处理非 MMA 瓶颈，例如指数、shared memory、TMEM 和前后向流水。  CompileMask 解决的是 **'><div class='section-head'><h2>编译、FlashAttention 与 MoE 融合：提高单层有效计算密度</h2><div class='doc-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></div></div><div class='path'>03_concepts/compile_attention_moe_optimization.md</div><div class='doc-body'><div id='doc-03-concepts-compile-attention-moe-optimization-md-一句话结论' class='subhead subhead-l3'><h3>一句话结论</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></span></div>
+<p>这张卡讲的不是并行策略，而是：<strong>模型已经能跑之后，单卡/单层内部还有哪些无效工作可以压掉</strong>。</p>
+<p>主线分两段：</p>
+<ul>
+<li><strong>Attention 侧</strong>：减少 HBM 往返，跳过不可见 block，保证多目标拼接不泄漏。</li>
+<li><strong>MoE 侧</strong>：减少小 GEMM 和 kernel launch，提高本地 expert 计算效率。</li>
+</ul>
+<p>这些优化共同提高有效计算密度，但 <strong>不直接改变 ZeRO/FSDP/EP 的通信语义</strong>。</p>
 <div id='doc-03-concepts-compile-attention-moe-optimization-md-核心矛盾-同一层里有四类浪费-不能混成一个-加速' class='subhead subhead-l3'><h3>核心矛盾：同一层里有四类浪费，不能混成一个“加速”</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></span></div>
-<p>训练慢不一定是模型太大，也可能是同一层内部做了很多低效工作。标准 attention 会生成 <code>[L,L]</code> 的 score/probability，中间张量大、HBM 往返多；复杂 mask 如果只是逐点判断，仍可能先算 QKᵀ 再把不可见位置丢掉；Label Packing 虽然能把多个目标拼进一条序列、少算重复历史，但如果组间可见性没处理好，就会发生目标泄漏；MoE native 逐专家 for 循环会产生很多小 GEMM 和 launch，矩阵单元利用率低。</p>
-<p>所以这张卡里的四件事必须按对象分清：<strong>FlashAttention 管 attention 中间矩阵的访存，CompileMask 管哪些 attention block 根本不用算，Label Packing 管多目标拼接后的组间隔离，MoE 融合管 expert 内部小 GEMM 的执行组织</strong>。它们都提升单层执行效率，但作用点不同，不能都说成“减少通信量”或“提高算术强度”。</p>
+<p>训练慢不一定是模型太大，也可能是同一层内部做了很多低效工作：</p>
+<div class='table-wrap'><table>
+<tr><th>浪费来源</th><th>具体问题</th><th>对应优化</th></tr>
+<tr><td><strong>attention 中间矩阵</strong></td><td><code>[L,L]</code> score/probability 反复落 HBM</td><td>FlashAttention</td></tr>
+<tr><td><strong>复杂 mask</strong></td><td>不可见位置仍可能先算 QKᵀ 再丢弃</td><td>CompileMask</td></tr>
+<tr><td><strong>多目标拼接</strong></td><td>Label Packing 省历史编码，但组间可能互看导致泄漏</td><td>Label Packing + CompileMask</td></tr>
+<tr><td><strong>MoE 小专家计算</strong></td><td>native 逐专家 for 循环，小 GEMM 多、launch 多</td><td>fused grouped GEMM</td></tr>
+</table></div>
+<p>所以读这张卡时要先按对象分清：<strong>FA 管访存，CompileMask 管 block 是否要算，Label Packing 管组间可见性，MoE 融合管 expert 本地执行组织</strong>。它们都提升单层执行效率，但不能都说成“减少通信量”或“提高算术强度”。</p>
 <div id='doc-03-concepts-compile-attention-moe-optimization-md-attention-链路-fa-决定块内怎么算-compilemask-决定哪些块要算-label-packing-决定哪些-token-允许互看' class='subhead subhead-l3'><h3>Attention 链路：FA 决定块内怎么算，CompileMask 决定哪些块要算，Label Packing 决定哪些 token 允许互看</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></span></div>
-<p>FlashAttention 解决的是标准 attention 的 IO 问题。它按 tile 读取 Q/K/V，在片上维护行级 max/sum，用 online softmax 得到和标准 attention 等价的结果，但不把完整 <code>[L,L]</code> score/probability 写回 HBM；反向时用轻量统计量重算必要块。这里的关键口径是：<strong>FA 不改变标准 attention 的数学目标，主要减少巨大中间矩阵的 HBM 读写</strong>。FA1 主要解决 IO；FA2 改进并行划分；FA3 面向 Hopper 做 TMA 搬运和 WGMMA 异步流水；FA4 面向 Blackwell 继续处理非 MMA 瓶颈，例如指数、shared memory、TMEM 和前后向流水。</p>
-<p>CompileMask 解决的是复杂 mask 的表达和块跳过问题。它不是一个固定 mask，而是 UniAttention 自研的声明式 mask 编译栈：frontend 用 BoolExpr/MaskSpec AST 表达 <code>(q,kv)→bool</code> 的可见性规则；codegen 把 AST 编译到 TileLang kernel，并从 forward mask 符号推导 backward kernel；verifier 校验编译出的 kernel 是否和声明规则一致。真正的加速点不在布尔判断本身，而在“区间分析 → block 跳过”：codegen 用 <code>_DenseIntervalValue [lower,upper]</code> 推导每个 query 可见的 kv 连续区间，把区间边界对齐到 block，生成只循环这些 block 的 kernel。被 mask 的 block 连 QKᵀ 都不算，不是算完再乘 0。</p>
-<p>Label Packing 是上面两者的业务触发场景之一。它把多个目标拼进一条序列，让历史只编码一次；但拼接后必须保证组间不该互看，否则 listwise 语义被破坏。普通 causal mask 隔离不了“后组看前组”，逐点 mask 又会带来 N² 判断和无效 QKᵀ。CompileMask 可以把这种组隔离规则编译成 block-sparse attention：例如 prompt + 组 A + 组 B 的布局里，组 B 的 query 对组 A 的列整块不可见，codegen 识别后直接跳过该 block。这里还有两个正确性边界：teacher forcing 要每组分别右移，不能把多组整体右移导致输入侧泄漏；独立多目标训练 <code>p(SID_j | history)</code> 和 listwise <code>p(item_j | history, item_&lt;j)</code> 是不同任务，不能只因为“多个商品拼起来”就混为一种优化。</p>
+<p>FlashAttention 解决的是 <strong>标准 attention 的 IO 问题</strong>：</p>
+<ol>
+<li>按 tile 读取 Q/K/V。</li>
+<li>在片上维护行级 max/sum。</li>
+<li>用 online softmax 得到和标准 attention 等价的结果。</li>
+<li>不把完整 <code>[L,L]</code> score/probability 写回 HBM。</li>
+<li>反向时用轻量统计量重算必要块。</li>
+</ol>
+<p>关键口径：<strong>FA 不改变标准 attention 的数学目标，主要减少巨大中间矩阵的 HBM 读写</strong>。FA1 主要解决 IO；FA2 改进并行划分；FA3 面向 Hopper 做 TMA 搬运和 WGMMA 异步流水；FA4 面向 Blackwell 继续处理非 MMA 瓶颈，例如指数、shared memory、TMEM 和前后向流水。</p>
+<p>CompileMask 解决的是 <strong>复杂 mask 的表达和 block 跳过</strong>。它不是一个固定 mask，而是 UniAttention 自研的声明式 mask 编译栈：</p>
+<ul>
+<li><strong>frontend</strong>：用 BoolExpr/MaskSpec AST 表达 <code>(q,kv)→bool</code> 的可见性规则。</li>
+<li><strong>codegen</strong>：把 AST 编译到 TileLang kernel，并从 forward mask 符号推导 backward kernel。</li>
+<li><strong>verifier</strong>：校验编译出的 kernel 是否和声明规则一致。</li>
+</ul>
+<p>真正加速点是：<strong>区间分析 → block 跳过</strong>。codegen 用 <code>_DenseIntervalValue [lower,upper]</code> 推导每个 query 可见的 kv 连续区间，把边界对齐到 block，只循环这些 block。被 mask 的 block <strong>连 QKᵀ 都不算</strong>，不是算完再乘 0。</p>
+<p>Label Packing 是上面两者的业务触发场景。它把多个目标拼进一条序列，让历史只编码一次；但拼接后必须保证 <strong>组间不该互看</strong>，否则 listwise 语义会被破坏。</p>
+<ul>
+<li><strong>普通 causal mask 不够</strong>：隔离不了“后组看前组”。</li>
+<li><strong>逐点 mask 太慢</strong>：会带来 N² 判断，并且可能先算 QKᵀ 再丢弃。</li>
+<li><strong>CompileMask 的作用</strong>：把组隔离规则编译成 block-sparse attention，整块不可见就整块跳过。</li>
+</ul>
+<p>正确性边界也要说清：<strong>teacher forcing 要每组分别右移</strong>，不能把多组整体右移导致输入侧泄漏；<strong>独立多目标训练</strong> <code>p(SID_j | history)</code> 和 <strong>listwise</strong> <code>p(item_j | history, item_&lt;j)</code> 是不同任务，不能只因为“多个商品拼起来”就混为一种优化。</p>
 <div id='doc-03-concepts-compile-attention-moe-optimization-md-moe-链路-ep-负责跨卡送-token-融合算子只解决本地-expert-怎么高效算' class='subhead subhead-l3'><h3>MoE 链路：EP 负责跨卡送 token，融合算子只解决本地 expert 怎么高效算</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></span></div>
-<p>MoE 慢不只慢在 expert 计算，还慢在 router 分桶、dispatch/combine、padding 和许多小 GEMM。这里要先分清两层：<strong>EP all-to-all 是跨卡通信，负责把 token hidden 送到 expert 所在 rank；MoE 融合是单卡内部执行优化，负责把本地收到的 token 高效过专家</strong>。MoE 融合不会减少 EP dispatch/combine 的 token hidden 字节数。</p>
-<p>native 实现通常是 Python for 循环逐专家算，O(E) 次 launch，每个专家的 token 数又可能很少，导致 GEMM 规模小、矩阵单元利用率低。fused grouped GEMM 的链路是：先 permute，把 token 按目标 expert 排成连续段；再按 <code>offs</code> 分段，用 grouped GEMM 在一次 kernel 内并行计算多个专家；最后 unpermute / scatter_add 回原 token 位置，合并 top-k 贡献。权重布局常堆成 <code>w1[E,D,2*inter]</code> 和 <code>w2[E,inter,D]</code>，其中 <code>2*inter</code> 来自 SwiGLU 的 gate+up 两支。它快在两个点：减少 CPU launch，且把多个小专家 GEMM 组织成一次 grouped GEMM，提高 Tensor Core 利用率。</p>
-<p>Token 负载均衡和动态组批是另一条链：router 分布越均匀，EP all-to-all 和 expert 计算越容易同步结束；按 token 预算组批可以减少某些 rank token 过多导致的 straggler。它们改善的是负载波动和等待暴露，不等于 fused grouped GEMM 本身减少了计算量。FLOPs 口径也要说清：MoE 的 FFN 有效宽度按激活专家数 <code>k × moe_intermediate_size</code> 算，不按总专家数 E 算；grouped GEMM 和 native 是同一计算量的不同实现，不改变理论 FLOPs。</p>
+<p>MoE 慢不只慢在 expert 计算，还慢在 router 分桶、dispatch/combine、padding 和许多小 GEMM。先分清两层：</p>
+<ul>
+<li><strong>EP all-to-all</strong>：跨卡通信，负责把 token hidden 送到 expert 所在 rank。</li>
+<li><strong>MoE 融合</strong>：单卡内部执行优化，负责把本地收到的 token 高效过专家。</li>
+</ul>
+<p>因此，MoE 融合 <strong>不会减少 EP dispatch/combine 的 token hidden 字节数</strong>。</p>
+<p>native 实现的问题是：Python for 循环逐专家算，O(E) 次 launch；每个专家 token 数又可能很少，导致 GEMM 规模小、矩阵单元利用率低。</p>
+<p>fused grouped GEMM 的链路是：</p>
+<ol>
+<li><strong>permute</strong>：把 token 按目标 expert 排成连续段。</li>
+<li><strong>grouped GEMM</strong>：按 <code>offs</code> 分段，在一次 kernel 内并行计算多个专家。</li>
+<li><strong>unpermute / scatter_add</strong>：回到原 token 位置，合并 top-k 贡献。</li>
+</ol>
+<p>权重常堆成 <code>w1[E,D,2*inter]</code> 和 <code>w2[E,inter,D]</code>，其中 <code>2*inter</code> 来自 SwiGLU 的 gate+up 两支。它快在两点：<strong>减少 CPU launch</strong>，以及 <strong>把多个小专家 GEMM 组织成一次 grouped GEMM，提高 Tensor Core 利用率</strong>。</p>
+<p>Token 负载均衡和动态组批是另一条链：router 分布越均匀，EP all-to-all 和 expert 计算越容易同步结束；按 token 预算组批可以减少某些 rank token 过多导致的 straggler。它们改善的是 <strong>负载波动和等待暴露</strong>，不等于 fused grouped GEMM 本身减少了理论计算量。</p>
+<p>FLOPs 口径也要固定：MoE FFN 有效宽度按 <strong><code>k × moe_intermediate_size</code></strong> 算，不按总专家数 E 算；grouped GEMM 和 native 是同一计算量的不同实现，不改变理论 FLOPs。</p>
 <div id='doc-03-concepts-compile-attention-moe-optimization-md-为什么有效-和我的项目怎么关联-待核验边界' class='subhead subhead-l3'><h3>为什么有效、和我的项目怎么关联、待核验边界</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></span></div>
-<p>这几类优化有效，是因为它们分别切掉了不同形态的无效工作：FA 少落 attention 中间矩阵到 HBM；CompileMask 少算不可见 block 的 QKᵀ/softmax/value 聚合；Label Packing 少算重复历史编码但用组隔离保护任务语义；MoE 融合少 launch、把碎小 expert GEMM 合并调度；动态 token 预算和 router 负载均衡减少慢 rank 等待。它们和 FSDP2/DeepSpeed 不是替代关系：FSDP2/DeepSpeed 管参数、梯度、优化器状态生命周期，这张卡管单层算子、mask、图和负载组织。</p>
-<p>项目一算子线用到这些能力：FA4（少落 HBM）、CompileMask（跳过被 mask 的 block）、Label Packing（多目标拼接并做组隔离）、MoE 融合（少 launch、提高 grouped GEMM 利用率）。它们共同提高 Backbone 的有效执行效率，是 MFU 53.8%/29.57% 的来源之一；但单项贡献尚未单独归因，仍需要 profiler 对比。</p></div></section><section id='doc-03-concepts-cp-gsu-md' class='doc-section' data-search='CP-GSU 稀疏化：把 padding 稠密计算改成只算真实行为 03_concepts/cp_gsu.md ## 一句话结论  长行为序列为了 batch 化被 padding 到同一长度，但 **padding 位置不是真实行为**，不该占计算和显存。CP-GSU 把“对 `[batch,max_seq,hidden]` 全量 dense 算”改成“**只对真实有效行为位置算**”，冗余计算和显存都降下来。  ## 难点：padding 被当成真实 token 冗余计算  推荐长序列里，最长可能 10 万级，但很多用户真实行为远小于上限。旧方式按最大长度构造 dense tensor，所有位置都进算子——等于把 **padding 当成真实 token 参与计算**，既多算了、又多存了中间激活。  ## 怎么设计：把稀疏索引当第一等公民  不再物化 padding 后的 dense 张量，而是保留“真实有效行为”的**位置/用户分组/序列 offset 索引 + 紧凑 value**，算子**只对有效位置做 gather / scatter / 聚合** / GSU 相关计算。代价是多一份索引元数据和更复杂的算子实现。  ## 为什么有效：算的量和存的量都跟着真实长度走  成本跟着真实长度走：  - dense 成本约 `B·S_max·H`，稀疏约 `B·S_real·H + index_metadata`。 - 当 `S_real &lt;&lt; S_max` 时，**冗余比例约 `1 - S_real/S_max`**。  项目口径：**减少 70% 冗余计算、显存 70GB→20GB、训练吞吐提升 70%**。收益来自“少算 padding + 少存 padding 激活/中间结果”。  ⚠️ 这是“思想能讲清、结构未逐行核验”的卡：全称、模型内位置、输入输出 shape 仍是 open 缺口，答辩时只讲机制与口径，不声称已核验具体实现。  ## 和 SparseGroup 的区别  SparseGroup 是**通信压缩**（共享坐标、少传重复结构），CP-GSU 是**计算稀疏化**（只算真实行为、少算 padding）。两者都依赖“稀疏索引是第一等公民”，但**一个省通信、一个省计算**，别混。  ## 和我的项目怎么关联  项目二-1 计算线的核心亮点就是这条：  - **用了什么能力**：CP-GSU 把 `[batch,max_seq,hidden]` 的 padding dense 计算，改成只对真实有效行为位置做 gather/scatter/聚合。 - **解决什么问题**：序列扩到十万级后，padding 被当成真实 token 参与计算，显存 70GB、大量冗余计算。 - **达到什么效果**：冗余计算减 70%、显存 70GB→20GB、训练吞吐提升 70%（项目口径；CP-GSU 全称/结构/shape 仍待逐行核验）。'><div class='section-head'><h2>CP-GSU 稀疏化：把 padding 稠密计算改成只算真实行为</h2><div class='doc-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-lrm-long-sequence-training-md'>回项目</a></div></div><div class='path'>03_concepts/cp_gsu.md</div><div class='doc-body'><div id='doc-03-concepts-cp-gsu-md-一句话结论' class='subhead subhead-l3'><h3>一句话结论</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-lrm-long-sequence-training-md'>回项目</a></span></div>
+<p>这些优化分别切掉不同形态的无效工作：</p>
+<ul>
+<li><strong>FA</strong>：少落 attention 中间矩阵到 HBM。</li>
+<li><strong>CompileMask</strong>：少算不可见 block 的 QKᵀ / softmax / value 聚合。</li>
+<li><strong>Label Packing</strong>：少算重复历史编码，同时用组隔离保护任务语义。</li>
+<li><strong>MoE 融合</strong>：少 launch，把碎小 expert GEMM 合并调度。</li>
+<li><strong>动态组批 / 负载均衡</strong>：减少慢 rank 等待。</li>
+</ul>
+<p>项目一算子线用到这些能力：<strong>FA4、CompileMask、Label Packing、MoE 融合</strong>。它们共同提高 Backbone 的有效执行效率，是 MFU 53.8%/29.57% 的来源之一；但单项贡献尚未单独归因，需要 profiler 对比。</p>
+<p>它们和 FSDP2/DeepSpeed 不是替代关系：<strong>FSDP2/DeepSpeed 管参数、梯度、优化器状态生命周期；这张卡管单层算子、mask、图和负载组织</strong>。</p>
+<p><strong>来源</strong>：</p>
+<p><strong>待核验</strong>：</p>
+<ul>
+<li><strong>FA4</strong>：B300 上的实际 kernel、fallback 条件和 profiler 收益。</li>
+<li><strong>CompileMask</strong>：TileLang 后端在多硬件（含 NPU）的覆盖，以及与 FlexAttention 的性能对比。</li>
+<li><strong>MoE 融合</strong>：expert grouping、padding/capacity、token drop 策略，以及 fused bf16 vs native fp32 数值对拍。</li>
+<li><strong>Label Packing</strong>：组隔离实现与业务 Collator 只拼不隔离两条路径，线上实际使用哪条要按部署版本确认。</li>
+</ul></div></section><section id='doc-03-concepts-cp-gsu-md' class='doc-section' data-search='CP-GSU 稀疏化：把 padding 稠密计算改成只算真实行为 03_concepts/cp_gsu.md ## 一句话结论  长行为序列为了 batch 化被 padding 到同一长度，但 **padding 位置不是真实行为**，不该占计算和显存。CP-GSU 把“对 `[batch,max_seq,hidden]` 全量 dense 算”改成“**只对真实有效行为位置算**”，冗余计算和显存都降下来。  ## 难点：padding 被当成真实 token 冗余计算  推荐长序列里，最长可能 10 万级，但很多用户真实行为远小于上限。旧方式按最大长度构造 dense tensor，所有位置都进算子——等于把 **padding 当成真实 token 参与计算**，既多算了、又多存了中间激活。  ## 怎么设计：把稀疏索引当第一等公民  不再物化 padding 后的 dense 张量，而是保留“真实有效行为”的**位置/用户分组/序列 offset 索引 + 紧凑 value**，算子**只对有效位置做 gather / scatter / 聚合** / GSU 相关计算。代价是多一份索引元数据和更复杂的算子实现。  ## 为什么有效：算的量和存的量都跟着真实长度走  成本跟着真实长度走：  - dense 成本约 `B·S_max·H`，稀疏约 `B·S_real·H + index_metadata`。 - 当 `S_real &lt;&lt; S_max` 时，**冗余比例约 `1 - S_real/S_max`**。  项目口径：**减少 70% 冗余计算、显存 70GB→20GB、训练吞吐提升 70%**。收益来自“少算 padding + 少存 padding 激活/中间结果”。  ⚠️ 这是“思想能讲清、结构未逐行核验”的卡：全称、模型内位置、输入输出 shape 仍是 open 缺口，答辩时只讲机制与口径，不声称已核验具体实现。  ## 和 SparseGroup 的区别  SparseGroup 是**通信压缩**（共享坐标、少传重复结构），CP-GSU 是**计算稀疏化**（只算真实行为、少算 padding）。两者都依赖“稀疏索引是第一等公民”，但**一个省通信、一个省计算**，别混。  ## 和我的项目怎么关联  项目二-1 计算线的核心亮点就是这条：  - **用了什么能力**：CP-GSU 把 `[batch,max_seq,hidden]` 的 padding dense 计算，改成只对真实有效行为位置做 gather/scatter/聚合。 - **解决什么问题**：序列扩到十万级后，padding 被当成真实 token 参与计算，显存 70GB、大量冗余计算。 - **达到什么效果**：冗余计算减 70%、显存 70GB→20GB、训练吞吐提升 70%（项目口径；CP-GSU 全称/结构/shape 仍待逐行核验）。'><div class='section-head'><h2>CP-GSU 稀疏化：把 padding 稠密计算改成只算真实行为</h2><div class='doc-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-lrm-long-sequence-training-md'>回项目</a></div></div><div class='path'>03_concepts/cp_gsu.md</div><div class='doc-body'><div id='doc-03-concepts-cp-gsu-md-一句话结论' class='subhead subhead-l3'><h3>一句话结论</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-lrm-long-sequence-training-md'>回项目</a></span></div>
 <p>长行为序列为了 batch 化被 padding 到同一长度，但 <strong>padding 位置不是真实行为</strong>，不该占计算和显存。CP-GSU 把“对 <code>[batch,max_seq,hidden]</code> 全量 dense 算”改成“<strong>只对真实有效行为位置算</strong>”，冗余计算和显存都降下来。</p>
 <div id='doc-03-concepts-cp-gsu-md-难点-padding-被当成真实-token-冗余计算' class='subhead subhead-l3'><h3>难点：padding 被当成真实 token 冗余计算</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-lrm-long-sequence-training-md'>回项目</a></span></div>
 <p>推荐长序列里，最长可能 10 万级，但很多用户真实行为远小于上限。旧方式按最大长度构造 dense tensor，所有位置都进算子——等于把 <strong>padding 当成真实 token 参与计算</strong>，既多算了、又多存了中间激活。</p>
@@ -1545,20 +1677,76 @@ Step 7: 对 top-k 输出按 router 权重合并，进入下一层
 <li><a href='#doc-03-concepts-multi-hardware-backbone-md'>多硬件底座 Backbone Infra</a>：训练/生成/导出路径分开、硬件差异收口。</li>
 </ul>
 <div id='doc-02-domain-map-layer7-model-base-md-阅读顺序' class='subhead subhead-l3'><h3>阅读顺序</h3><span class='heading-actions'><a href='#toc'>回目录</a></span></div>
-<p>先 HSTU（一个具体 backbone 怎么算），再多硬件底座（怎么把不同 backbone 和硬件统一）。</p></div></section><section id='doc-03-concepts-hstu-backbone-md' class='doc-section' data-search='HSTU：用 silu/N 代替 softmax 的排序侧 backbone 03_concepts/hstu_backbone.md ## 一句话结论  HSTU（Hierarchical Sequential Transduction Unit）是 OneRec 排序侧的 dense backbone。它和标准 Transformer 的关键差异不是“换了一个 attention 名字”，而是把排序场景里的历史行为贡献建模成**逐对相关性**：没有独立 FFN，激活融进 UVQK 投影，attention 用 `silu(QKᵀ·α)/N` 代替 `softmax(QKᵀ/√d)`，再用 user 路门控输出。  ## 核心矛盾：排序侧历史贡献不一定是 softmax 概率  标准 Transformer 的 softmax attention 会把每个 query 对所有可见 key 的注意力归一成一行概率，总和为 1。这适合很多序列建模场景，但在推荐排序里，一个历史行为对候选的贡献不一定要和其它历史行为竞争同一个概率总量；多个历史行为可以同时提供正向证据，也可能被抑制到接近 0。HSTU 因此用 silu 做逐元素相关性激活，而不是用 softmax 做跨位置归一；`/N` 只负责把序列长度变化带来的量级拉回可比范围。  这个设计的因果链是：排序侧需要表达“多个历史行为共同影响候选” → softmax 行归一会让贡献互相竞争 → silu/N 不跨位置归一，每个 pair 的相关性可以独立放大、抑制或接近 0 → 更贴合排序侧逐对相关性加权的语义。  ## 一层 HSTU 怎么算：UVQK 融合投影、silu/N attention、user 门控输出  一层 HSTU 的执行链路可以顺着张量走。输入先做 LayerNorm；然后一个大 `Linear(d_model, 2Dv·H + 2A·H)` 同时产出 user、value、query、key 四路，投影后整体过 silu 再 split。接着用 query/key 做 `QKᵀ`，缩放系数 `alpha = 1/√A`（A 是每头 QK 维），再用 `silu(QKᵀ·α)/N` 替代 softmax；非法位置由 mask 直接乘 0，不走 softmax 的 `-inf`。attention 输出经过 LN 后由 user 路逐元素门控，即 `user * LN(attn)`，最后投影回 `d_model` 并加残差。  这里有三个结构差异要一起理解：第一，HSTU 没有独立 FFN，silu 激活已经融进 UVQK 投影；第二，attention 不做行归一，而是按 pair 做 silu 相关性并用 `/N` 控制尺度；第三，user 路像 GLU/SwiGLU 一样控制 attention 输出放行多少。token 维 T 全程不变，变长表示是 `JaggedData(values[T,d_model], seql'><div class='section-head'><h2>HSTU：用 silu/N 代替 softmax 的排序侧 backbone</h2><div class='doc-actions'><a href='#toc'>回目录</a></div></div><div class='path'>03_concepts/hstu_backbone.md</div><div class='doc-body'><div id='doc-03-concepts-hstu-backbone-md-一句话结论' class='subhead subhead-l3'><h3>一句话结论</h3><span class='heading-actions'><a href='#toc'>回目录</a></span></div>
-<p>HSTU（Hierarchical Sequential Transduction Unit）是 OneRec 排序侧的 dense backbone。它和标准 Transformer 的关键差异不是“换了一个 attention 名字”，而是把排序场景里的历史行为贡献建模成<strong>逐对相关性</strong>：没有独立 FFN，激活融进 UVQK 投影，attention 用 <code>silu(QKᵀ·α)/N</code> 代替 <code>softmax(QKᵀ/√d)</code>，再用 user 路门控输出。</p>
+<p>先 HSTU（一个具体 backbone 怎么算），再多硬件底座（怎么把不同 backbone 和硬件统一）。</p></div></section><section id='doc-03-concepts-hstu-backbone-md' class='doc-section' data-search='HSTU：用 silu/N 代替 softmax 的排序侧 backbone 03_concepts/hstu_backbone.md ## 一句话结论  HSTU（Hierarchical Sequential Transduction Unit）是 OneRec 排序侧的 dense backbone。核心变化是：**把历史行为对候选的影响建模成逐对相关性，而不是 softmax 概率分布**。  它的结构特征是：**无独立 FFN**、**UVQK 融合投影**、**`silu(QKᵀ·α)/N` 替代 softmax**、以及 **user 路门控输出**。  ## 核心矛盾：排序侧历史贡献不一定是 softmax 概率  标准 Transformer 的 softmax attention 会把每个 query 对所有可见 key 的注意力归一成一行概率，总和为 1。这个设计的问题是：**所有历史行为必须竞争同一个总量**。  推荐排序里更常见的语义是：  - **多个历史行为可以同时提供正向证据**。 - 某些行为也可以被抑制到接近 0。 - 历史贡献更像 **pairwise relevance**，不一定是概率分配。  所以 HSTU 的替换逻辑是：  ```text 排序侧需要多个历史行为共同影响候选 → softmax 行归一会让贡献互相竞争 → silu/N 不跨位置归一 → 每个 pair 的相关性可以独立放大、抑制或接近 0 ```  `/N` 的作用不是概率归一，而是**控制序列长度变化带来的量级漂移**。  ## 一层 HSTU 怎么算：UVQK 融合投影、silu/N attention、user 门控输出  一层 HSTU 顺着张量看是五步：  1. **输入 LayerNorm**：按 `d_model` 维归一。 2. **UVQK 融合投影**：一个大 `Linear(d_model, 2Dv·H + 2A·H)` 同时产出 `user/value/query/key` 四路，投影后整体过 silu 再 split。 3. **HSTU attention**：用 `silu(QKᵀ·α)/N` 替代 softmax；`alpha = 1/√A`，A 是每头 QK 维。 4. **user 门控**：attention 输出过 LN 后，被 user 路逐元素门控，即 `user * LN(attn)`。 5. **残差投影**：输出投影回 `d_model`，加回输入。  三个结构差异要一起看：  - **无独立 FFN**：silu 激活已经融进 UVQK 投影。 - **attention 不行归一**：按 pair 做 silu 相关性，并用 `/N` 控制尺度。 - **user 路控制输出**：类似 GLU/SwiGLU，决定 attention 输出放行多少。  张量形态也要清楚：**token 维 T 全程不变**。输入输出是变长 `J'><div class='section-head'><h2>HSTU：用 silu/N 代替 softmax 的排序侧 backbone</h2><div class='doc-actions'><a href='#toc'>回目录</a></div></div><div class='path'>03_concepts/hstu_backbone.md</div><div class='doc-body'><div id='doc-03-concepts-hstu-backbone-md-一句话结论' class='subhead subhead-l3'><h3>一句话结论</h3><span class='heading-actions'><a href='#toc'>回目录</a></span></div>
+<p>HSTU（Hierarchical Sequential Transduction Unit）是 OneRec 排序侧的 dense backbone。核心变化是：<strong>把历史行为对候选的影响建模成逐对相关性，而不是 softmax 概率分布</strong>。</p>
+<p>它的结构特征是：<strong>无独立 FFN</strong>、<strong>UVQK 融合投影</strong>、<strong><code>silu(QKᵀ·α)/N</code> 替代 softmax</strong>、以及 <strong>user 路门控输出</strong>。</p>
 <div id='doc-03-concepts-hstu-backbone-md-核心矛盾-排序侧历史贡献不一定是-softmax-概率' class='subhead subhead-l3'><h3>核心矛盾：排序侧历史贡献不一定是 softmax 概率</h3><span class='heading-actions'><a href='#toc'>回目录</a></span></div>
-<p>标准 Transformer 的 softmax attention 会把每个 query 对所有可见 key 的注意力归一成一行概率，总和为 1。这适合很多序列建模场景，但在推荐排序里，一个历史行为对候选的贡献不一定要和其它历史行为竞争同一个概率总量；多个历史行为可以同时提供正向证据，也可能被抑制到接近 0。HSTU 因此用 silu 做逐元素相关性激活，而不是用 softmax 做跨位置归一；<code>/N</code> 只负责把序列长度变化带来的量级拉回可比范围。</p>
-<p>这个设计的因果链是：排序侧需要表达“多个历史行为共同影响候选” → softmax 行归一会让贡献互相竞争 → silu/N 不跨位置归一，每个 pair 的相关性可以独立放大、抑制或接近 0 → 更贴合排序侧逐对相关性加权的语义。</p>
+<p>标准 Transformer 的 softmax attention 会把每个 query 对所有可见 key 的注意力归一成一行概率，总和为 1。这个设计的问题是：<strong>所有历史行为必须竞争同一个总量</strong>。</p>
+<p>推荐排序里更常见的语义是：</p>
+<ul>
+<li><strong>多个历史行为可以同时提供正向证据</strong>。</li>
+<li>某些行为也可以被抑制到接近 0。</li>
+<li>历史贡献更像 <strong>pairwise relevance</strong>，不一定是概率分配。</li>
+</ul>
+<p>所以 HSTU 的替换逻辑是：</p>
+<pre><code>
+排序侧需要多个历史行为共同影响候选
+
+→ softmax 行归一会让贡献互相竞争
+
+→ silu/N 不跨位置归一
+
+→ 每个 pair 的相关性可以独立放大、抑制或接近 0
+
+</code></pre>
+<p><code>/N</code> 的作用不是概率归一，而是<strong>控制序列长度变化带来的量级漂移</strong>。</p>
 <div id='doc-03-concepts-hstu-backbone-md-一层-hstu-怎么算-uvqk-融合投影-silu-n-attention-user-门控输出' class='subhead subhead-l3'><h3>一层 HSTU 怎么算：UVQK 融合投影、silu/N attention、user 门控输出</h3><span class='heading-actions'><a href='#toc'>回目录</a></span></div>
-<p>一层 HSTU 的执行链路可以顺着张量走。输入先做 LayerNorm；然后一个大 <code>Linear(d_model, 2Dv·H + 2A·H)</code> 同时产出 user、value、query、key 四路，投影后整体过 silu 再 split。接着用 query/key 做 <code>QKᵀ</code>，缩放系数 <code>alpha = 1/√A</code>（A 是每头 QK 维），再用 <code>silu(QKᵀ·α)/N</code> 替代 softmax；非法位置由 mask 直接乘 0，不走 softmax 的 <code>-inf</code>。attention 输出经过 LN 后由 user 路逐元素门控，即 <code>user * LN(attn)</code>，最后投影回 <code>d_model</code> 并加残差。</p>
-<p>这里有三个结构差异要一起理解：第一，HSTU 没有独立 FFN，silu 激活已经融进 UVQK 投影；第二，attention 不做行归一，而是按 pair 做 silu 相关性并用 <code>/N</code> 控制尺度；第三，user 路像 GLU/SwiGLU 一样控制 attention 输出放行多少。token 维 T 全程不变，变长表示是 <code>JaggedData(values[T,d_model], seqlen[B], offsets[B+1])</code>；只有特征维在 <code>d_model ↔ H·Dv</code> 之间变化。attention 内部会临时 jagged→padding 成 <code>[B,H,N,·]</code> 计算 QKᵀ，算完再 <code>dense_to_jagged</code> 压回 <code>[T,H,Dv]</code>，所以 padding 只活在 attention 中间，输入输出仍是变长。</p>
-<p>mask 也要放在这条链里理解，而不是单独背“三层语义”。<code>_get_valid_attn_mask</code> 产出 <code>[B,N,N]</code> 0-1 掩码，对应 OneRec 序列结构：contextual（用户画像）+ history（历史行为）+ candidates（待排候选）。它包含因果可见性（query 只看自己和历史）、候选分组可见性（同组候选互见、跨组屏蔽）和上下文可见性（序列头部 contextual token 可被全序列看到）。这些规则决定哪些 pair 进入 <code>silu(QKᵀ·α)/N</code>，不是额外的通信或模型外逻辑。</p>
+<p>一层 HSTU 顺着张量看是五步：</p>
+<ol>
+<li><strong>输入 LayerNorm</strong>：按 <code>d_model</code> 维归一。</li>
+<li><strong>UVQK 融合投影</strong>：一个大 <code>Linear(d_model, 2Dv·H + 2A·H)</code> 同时产出 <code>user/value/query/key</code> 四路，投影后整体过 silu 再 split。</li>
+<li><strong>HSTU attention</strong>：用 <code>silu(QKᵀ·α)/N</code> 替代 softmax；<code>alpha = 1/√A</code>，A 是每头 QK 维。</li>
+<li><strong>user 门控</strong>：attention 输出过 LN 后，被 user 路逐元素门控，即 <code>user * LN(attn)</code>。</li>
+<li><strong>残差投影</strong>：输出投影回 <code>d_model</code>，加回输入。</li>
+</ol>
+<p>三个结构差异要一起看：</p>
+<ul>
+<li><strong>无独立 FFN</strong>：silu 激活已经融进 UVQK 投影。</li>
+<li><strong>attention 不行归一</strong>：按 pair 做 silu 相关性，并用 <code>/N</code> 控制尺度。</li>
+<li><strong>user 路控制输出</strong>：类似 GLU/SwiGLU，决定 attention 输出放行多少。</li>
+</ul>
+<p>张量形态也要清楚：<strong>token 维 T 全程不变</strong>。输入输出是变长 <code>JaggedData(values[T,d_model], seqlen[B], offsets[B+1])</code>；attention 内部临时 jagged→padding 成 <code>[B,H,N,·]</code> 算 QKᵀ，算完再 <code>dense_to_jagged</code> 压回 <code>[T,H,Dv]</code>。因此 <strong>padding 只存在于 attention 中间</strong>，不是整条 backbone 都变成 dense padding。</p>
+<p>mask 是这条链的一部分，不是额外机制。<code>_get_valid_attn_mask</code> 产出 <code>[B,N,N]</code> 0-1 掩码，对应 OneRec 的序列结构：</p>
+<ul>
+<li><strong>contextual</strong>：用户画像等上下文 token。</li>
+<li><strong>history</strong>：历史行为。</li>
+<li><strong>candidates</strong>：待排候选。</li>
+</ul>
+<p>mask 的三层语义是：<strong>因果可见性</strong>、<strong>候选分组可见性</strong>、<strong>上下文可见性</strong>。这些规则决定哪些 pair 进入 <code>silu(QKᵀ·α)/N</code>，不是跨卡通信，也不是模型外逻辑。</p>
 <div id='doc-03-concepts-hstu-backbone-md-工程边界与融合实现-hstu-本身不引入-collective-融合版省本地访存和调度' class='subhead subhead-l3'><h3>工程边界与融合实现：HSTU 本身不引入 collective，融合版省本地访存和调度</h3><span class='heading-actions'><a href='#toc'>回目录</a></span></div>
-<p>HSTU 是 sample rank 本地的 dense backbone。它的输入是上游稀疏侧通过 Emb A2A 送回来的 embedding 向量，输出是排序分数；跨卡通信发生在上游的稀疏查表/梯度回传，或下游更大模型上的 TP/EP/ZeRO，不发生在 HSTU 这一层本身。融合 kernel 的 async wgrad 也只是本地 stream 间重叠，不增加 collective。这个边界很重要：不要把“排序 backbone 怎么算”和“分布式通信怎么传”混在一起。</p>
-<p>生产版 <code>FusedHSTULayerFunction</code> 与 native 逐步计算等价，但把执行组织改成更适合 GPU 的形式：<code>addmm_silu_fwd</code> 把 LayerNorm/linear/silu 相关路径融合，matmul 结果在片上直接过 silu，减少一次 <code>[T,4Dv]</code> 往返读写；backward 手写，不完全依赖 autograd 自动微分；forward 只保存最小集合，backward 时重算 silu/qkv，用算力换显存；权重梯度可以在独立 stream 上异步计算，和主反向重叠。这里的收益是本地访存、显存和调度效率，不是通信量下降。</p>
+<p>HSTU 是 <strong>sample rank 本地的 dense backbone</strong>：</p>
+<ul>
+<li><strong>输入</strong>：上游稀疏侧通过 Emb A2A 送回来的 embedding 向量。</li>
+<li><strong>输出</strong>：排序分数。</li>
+<li><strong>跨卡通信边界</strong>：发生在上游稀疏查表/梯度回传，或下游更大模型上的 TP/EP/ZeRO，不发生在 HSTU 这一层本身。</li>
+</ul>
+<p>这个边界很重要：<strong>不要把“排序 backbone 怎么算”和“分布式通信怎么传”混在一起</strong>。</p>
+<p>生产版 <code>FusedHSTULayerFunction</code> 与 native 逐步计算等价，但执行组织更适合 GPU：</p>
+<ul>
+<li><strong>融合 LN/linear/silu 路径</strong>：<code>addmm_silu_fwd</code> 让 matmul 结果在片上直接过 silu，减少一次 <code>[T,4Dv]</code> 往返读写。</li>
+<li><strong>手写 backward</strong>：不完全依赖 autograd 自动微分。</li>
+<li><strong>重算省显存</strong>：forward 只保存最小集合，backward 重算 silu/qkv。</li>
+<li><strong>async wgrad</strong>：权重梯度在独立 stream 上异步算，和主反向重叠。</li>
+</ul>
+<p>这些收益是<strong>本地访存、显存和调度效率</strong>，不是通信量下降。</p>
 <div id='doc-03-concepts-hstu-backbone-md-和我的项目怎么关联-项目口径-来源与待核验' class='subhead subhead-l3'><h3>和我的项目怎么关联：项目口径、来源与待核验</h3><span class='heading-actions'><a href='#toc'>回目录</a></span></div>
-<p>项目里排序侧 backbone 就是 HSTU：UniRec 查向量后，HSTU 用 <code>silu/N</code> attention、UVQK 融合投影、三层 mask 和 user 门控来算排序分数，生产路径走 <code>FusedHSTULayerFunction</code> 融合 kernel。它解决的是 softmax 概率分布不一定适合排序侧逐对相关性建模的问题；达到的效果是排序侧结构更贴合业务语义，同时融合 kernel 省一次 <code>[T,4Dv]</code> 往返、async wgrad 与主反向重叠，是模型正确性和吞吐的一部分。</p></div></section><section id='doc-03-concepts-multi-hardware-backbone-md' class='doc-section' data-search='多硬件底座（Backbone Infra）：把 GPU/NPU 差异隔离开 03_concepts/multi_hardware_backbone.md ## 一句话结论  **换硬件不只是换后端**：算子、通信库、编译、精度、profiler 全都不同，直接把 GPU 代码搬上 NPU 会遇到算子缺失、编译入口不支持、精度分叉、归约顺序差异。Backbone Infra 把这些差异**隔离在底座里**，覆盖 T5 / T5-MoE / Qwen3 / DeepSeek-V4，**业务只碰一层统一接口**。  ## 怎么设计：三条边界先分清  多硬件底座不是“到处加 if npu”，而是把变化收在三条边界里：  1. **路径边界**：训练、生成、导出分开。训练一次处理已有目标前缀并反向；生成先 prefill 再逐 token decode；导出对齐在线推理。三条路径输入长度、cache 状态、控制分支不同，所以底座为训练和生成保留不同编译入口（`enable_gen_compile` 才建生成入口）。 2. **模型边界**：不同 backbone 的编译粒度不同。T5 整个 Backbone 作一个 `torch.compile` 入口；Qwen3 逐 Transformer Block 编译；两者都不包括 Reader、UniRec PS 和 DeepSpeed step，避免把数据/稀疏/优化器状态混进模型图。 3. **硬件边界**：GPU/NPU 差异只在底座层处理，包括算子替换、通信库选择（NCCL/HCCL）、精度策略、profiler 口径和 fallback。业务模型只调用统一接口，不直接感知具体硬件分支。  ## 为什么有效：业务只碰统一接口  三条边界分开后，问题定位也清楚：训练和生成结果不一致，先查路径边界；T5/Qwen3 编译表现不同，先查模型边界；GPU/NPU 数值或性能差异，先查硬件边界。这样业务换硬件、换底座不需要从零改，代价是底座要维护多套后端与适配逻辑。  ## 和我的项目怎么关联  项目一多硬件线就是这条能力：  - **用了什么能力**：Backbone Infra 把训练/生成/导出路径分开、按模型分派编译（T5 整模编译、Qwen3 逐 Block）、算子/通信/精度/profiler 差异收口。 - **解决什么问题**：在 GPU/NPU 两套硬件上训 T5/T5-MoE/Qwen3/DeepSeek-V4，算子缺失、编译入口、精度分叉、归约顺序都要适配。 - **达到什么效果**：业务只碰统一接口；NPU 编译入口当前是否开启、哪些算子已适配待核验，不能把历史 NPU 适配结果当“当前已开启”。'><div class='section-head'><h2>多硬件底座（Backbone Infra）：把 GPU/NPU 差异隔离开</h2><div class='doc-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></div></div><div class='path'>03_concepts/multi_hardware_backbone.md</div><div class='doc-body'><div id='doc-03-concepts-multi-hardware-backbone-md-一句话结论' class='subhead subhead-l3'><h3>一句话结论</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></span></div>
+<p>项目里排序侧 backbone 就是 HSTU：UniRec 查向量后，HSTU 用 <strong><code>silu/N</code> attention + UVQK 融合投影 + 三层 mask + user 门控</strong> 计算排序分数，生产路径走 <code>FusedHSTULayerFunction</code> 融合 kernel。</p>
+<p>它解决的是：<strong>softmax 概率分布不一定适合排序侧逐对相关性建模</strong>。效果是：排序侧结构更贴合业务语义，同时融合 kernel 省一次 <code>[T,4Dv]</code> 往返、async wgrad 与主反向重叠，是模型正确性和吞吐的一部分。</p>
+<p><strong>待核验</strong>：</p>
+<ul>
+<li><strong>native output-norm</strong>：<code>weight/bias</code> 疑似未参与计算（表达式结果未赋回），与融合版 norm 口径是否真一致。</li>
+<li><strong>融合 kernel 细节</strong>：<code>FusedHSTULayerFunction</code> 的 Triton tiling、async wgrad 的 stream/event 顺序仍未逐行展开。</li>
+</ul></div></section><section id='doc-03-concepts-multi-hardware-backbone-md' class='doc-section' data-search='多硬件底座（Backbone Infra）：把 GPU/NPU 差异隔离开 03_concepts/multi_hardware_backbone.md ## 一句话结论  **换硬件不只是换后端**：算子、通信库、编译、精度、profiler 全都不同，直接把 GPU 代码搬上 NPU 会遇到算子缺失、编译入口不支持、精度分叉、归约顺序差异。Backbone Infra 把这些差异**隔离在底座里**，覆盖 T5 / T5-MoE / Qwen3 / DeepSeek-V4，**业务只碰一层统一接口**。  ## 怎么设计：三条边界先分清  多硬件底座不是“到处加 if npu”，而是把变化收在三条边界里：  1. **路径边界**：训练、生成、导出分开。训练一次处理已有目标前缀并反向；生成先 prefill 再逐 token decode；导出对齐在线推理。三条路径输入长度、cache 状态、控制分支不同，所以底座为训练和生成保留不同编译入口（`enable_gen_compile` 才建生成入口）。 2. **模型边界**：不同 backbone 的编译粒度不同。T5 整个 Backbone 作一个 `torch.compile` 入口；Qwen3 逐 Transformer Block 编译；两者都不包括 Reader、UniRec PS 和 DeepSpeed step，避免把数据/稀疏/优化器状态混进模型图。 3. **硬件边界**：GPU/NPU 差异只在底座层处理，包括算子替换、通信库选择（NCCL/HCCL）、精度策略、profiler 口径和 fallback。业务模型只调用统一接口，不直接感知具体硬件分支。  ## 为什么有效：业务只碰统一接口  三条边界分开后，问题定位也清楚：训练和生成结果不一致，先查路径边界；T5/Qwen3 编译表现不同，先查模型边界；GPU/NPU 数值或性能差异，先查硬件边界。这样业务换硬件、换底座不需要从零改，代价是底座要维护多套后端与适配逻辑。  ## 和我的项目怎么关联  项目一多硬件线就是这条能力：  - **用了什么能力**：Backbone Infra 把训练/生成/导出路径分开、按模型分派编译（T5 整模编译、Qwen3 逐 Block）、算子/通信/精度/profiler 差异收口。 - **解决什么问题**：在 GPU/NPU 两套硬件上训 T5/T5-MoE/Qwen3/DeepSeek-V4，算子缺失、编译入口、精度分叉、归约顺序都要适配。 - **达到什么效果**：业务只碰统一接口；NPU 编译入口当前是否开启、哪些算子已适配待核验，不能把历史 NPU 适配结果当“当前已开启”。'><div class='section-head'><h2>多硬件底座（Backbone Infra）：把 GPU/NPU 差异隔离开</h2><div class='doc-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></div></div><div class='path'>03_concepts/multi_hardware_backbone.md</div><div class='doc-body'><div id='doc-03-concepts-multi-hardware-backbone-md-一句话结论' class='subhead subhead-l3'><h3>一句话结论</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></span></div>
 <p><strong>换硬件不只是换后端</strong>：算子、通信库、编译、精度、profiler 全都不同，直接把 GPU 代码搬上 NPU 会遇到算子缺失、编译入口不支持、精度分叉、归约顺序差异。Backbone Infra 把这些差异<strong>隔离在底座里</strong>，覆盖 T5 / T5-MoE / Qwen3 / DeepSeek-V4，<strong>业务只碰一层统一接口</strong>。</p>
 <div id='doc-03-concepts-multi-hardware-backbone-md-怎么设计-三条边界先分清' class='subhead subhead-l3'><h3>怎么设计：三条边界先分清</h3><span class='heading-actions'><a href='#toc'>回目录</a><a href='#doc-04-projects-gr-distributed-training-engine-md'>回项目</a></span></div>
 <p>多硬件底座不是“到处加 if npu”，而是把变化收在三条边界里：</p>
